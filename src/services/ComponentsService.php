@@ -15,10 +15,13 @@ use craft\helpers\UrlHelper;
 use craft\web\View;
 use putyourlightson\sprig\base\Component;
 use putyourlightson\sprig\components\RefreshOnLoad;
+use putyourlightson\sprig\errors\FriendlyInvalidVariableException;
 use putyourlightson\sprig\events\ComponentEvent;
 use putyourlightson\sprig\helpers\Html;
 use putyourlightson\sprig\plugin\components\SprigPlayground;
 use putyourlightson\sprig\Sprig;
+use putyourlightson\sprig\web\assets\HtmxAssetBundle;
+use putyourlightson\sprig\web\assets\HtmxPreloadAssetBundle;
 use Twig\Markup;
 use yii\base\InvalidArgumentException;
 use yii\base\Model;
@@ -28,8 +31,7 @@ use yii\web\Request;
 
 /**
  * @property-read string $scriptUrl
- * @property-read string $preloadScriptUrl
- * @property-write bool $addScripts
+ * @property-write bool $addScript
  */
 class ComponentsService extends BaseComponent
 {
@@ -76,7 +78,6 @@ class ComponentsService extends BaseComponent
         'cache',
         'listen',
         'method',
-        'preload',
         'replace',
         'val',
     ];
@@ -89,6 +90,7 @@ class ComponentsService extends BaseComponent
         'confirm',
         'delete',
         'disable',
+        'disabled-elt',
         'disinherit',
         'encoding',
         'ext',
@@ -135,7 +137,7 @@ class ComponentsService extends BaseComponent
      * @const string The htmx version to load (must exist in `HTMX_SCRIPT_BASE_PATH`).
      * Downloaded from https://unpkg.com/htmx.org
      */
-    public const HTMX_VERSION = '1.9.5';
+    public const HTMX_VERSION = '1.9.6';
 
     /**
      * @var string|null
@@ -150,12 +152,7 @@ class ComponentsService extends BaseComponent
     /**
      * @var bool
      */
-    private bool $_addScripts = true;
-
-    /**
-     * @var bool
-     */
-    private bool $_loadPreloadExtension = false;
+    private bool $_addScript = true;
 
     /**
      * Returns the URL to the htmx script.
@@ -169,21 +166,11 @@ class ComponentsService extends BaseComponent
     }
 
     /**
-     * Returns the URL to the htmx preload extension script.
+     * Sets whether the script should be automatically added to the output.
      */
-    public function getPreloadScriptUrl(): string
+    public function setAddScript(bool $value): void
     {
-        $path = self::HTMX_SCRIPT_BASE_PATH . self::HTMX_VERSION . '/ext/preload.js';
-
-        return Craft::$app->getAssetManager()->getPublishedUrl($path, true);
-    }
-
-    /**
-     * Sets whether scripts should be automatically added to the output.
-     */
-    public function setAddScripts(bool $value): void
-    {
-        $this->_addScripts = $value;
+        $this->_addScript = $value;
     }
 
     /**
@@ -273,10 +260,6 @@ class ComponentsService extends BaseComponent
             $attributes
         );
 
-        if ($this->_loadPreloadExtension) {
-            $this->_mergeCommaSeperatedAttribute($attributes, 'ext', 'preload');
-        }
-
         $this->_parseAttributes($attributes);
 
         $event->output = Html::tag('div', $content, $attributes);
@@ -286,11 +269,7 @@ class ComponentsService extends BaseComponent
         }
 
         if ($this->_addScripts === true) {
-            Craft::$app->getView()->registerJsFile($this->getScriptUrl(), [], 'htmx');
-
-            if ($this->_loadPreloadExtension) {
-                Craft::$app->getView()->registerJsFile($this->getPreloadScriptUrl(), [], 'htmx-preload');
-            }
+            Craft::$app->getView()->registerAssetBundle(HtmxAssetBundle::class);
         }
 
         return Template::raw($event->output);
@@ -487,11 +466,6 @@ class ComponentsService extends BaseComponent
             $cssSelectors = StringHelper::split($value);
             $triggers = array_map(fn($selector) => 'htmx:afterOnLoad from:' . $selector, $cssSelectors);
             $attributes[self::HTMX_PREFIX . 'trigger'] = join(',', $triggers);
-        } elseif ($name == 'preload') {
-            if (Component::getIsInclude()) {
-                $attributes['preload'] = $value === true ? 'preload:init' : $value;
-                $this->_loadPreloadExtension = true;
-            }
         } elseif ($name == 'replace') {
             $attributes[self::HTMX_PREFIX . 'select'] = $value;
             $attributes[self::HTMX_PREFIX . 'target'] = $value;
@@ -525,21 +499,6 @@ class ComponentsService extends BaseComponent
         }
 
         $attributes[$key] = Json::htmlEncode($values);
-    }
-
-    /**
-     * Merges a new value to existing comma seperated attribute values.
-     */
-    private function _mergeCommaSeperatedAttribute(array &$attributes, string $name, string $value): void
-    {
-        $key = self::HTMX_PREFIX . $name;
-        $values = empty($attributes[$key]) ? [] : explode(',', $attributes[$key]);
-
-        if (!in_array($value, $values)) {
-            $values[] = $value;
-        }
-
-        $attributes[$key] = implode(',', $values);
     }
 
     /**
@@ -624,15 +583,15 @@ class ComponentsService extends BaseComponent
         ];
 
         if ($value instanceof ElementInterface) {
-            $this->_throwError('element', $variable, $isArray);
+            $this->_throwInvalidVariableError('element', $variable, $isArray);
         }
 
         if ($value instanceof Model) {
-            $this->_throwError('model', $variable, $isArray);
+            $this->_throwInvalidVariableError('model', $variable, $isArray);
         }
 
         if (is_object($value)) {
-            $this->_throwError('object', $variable, $isArray);
+            $this->_throwInvalidVariableError('object', $variable, $isArray);
         }
 
         if (is_array($value)) {
@@ -654,7 +613,7 @@ class ComponentsService extends BaseComponent
         }
 
         if (is_object($value)) {
-            $this->_throwError($name, $value, $isArray);
+            $this->_throwInvalidVariableError($name, $value, $isArray);
         }
     }
 
@@ -671,9 +630,9 @@ class ComponentsService extends BaseComponent
     }
 
     /**
-     * Throws an error from a rendered template.
+     * Throws an invalid variable error.
      */
-    private function _throwError(string $name, mixed $value, bool $isArray = false): void
+    private function _throwInvalidVariableError(string $name, mixed $value, bool $isArray = false): void
     {
         $variables = [
             'name' => $name,
@@ -684,6 +643,13 @@ class ComponentsService extends BaseComponent
             'className' => $value::class,
             'componentName' => $this->_componentName,
         ];
+
+        // Only thrown an exception if Canary is enabled or devMode is off.
+        if (Craft::$app->getPlugins()->getPlugin('canary') !== null
+            || Craft::$app->getConfig()->getGeneral()->devMode === false
+        ) {
+            throw new FriendlyInvalidVariableException($variables);
+        }
 
         $content = Craft::$app->getView()->renderPageTemplate('sprig-core/_error', $variables, View::TEMPLATE_MODE_CP);
 
